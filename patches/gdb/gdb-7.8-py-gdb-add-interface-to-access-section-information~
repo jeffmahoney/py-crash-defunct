@@ -543,6 +543,43 @@ Signed-off-by: Jeff Mahoney <jeffm@suse.com>
  /* Implementation of gdb.Symbol.value (self[, frame]) -> gdb.Value.  Returns
     the value of the symbol, or an error in various circumstances.  */
  
+@@ -369,24 +391,28 @@ gdbpy_lookup_symbol (PyObject *self, PyO
+ 
+   if (block_obj)
+     block = block_object_to_block (block_obj);
+-  else
++
++  TRY_CATCH (except, RETURN_MASK_ALL)
++    {
++      symbol = lookup_symbol (name, block, domain, &is_a_field_of_this);
++    }
++  GDB_PY_HANDLE_EXCEPTION (except);
++
++  if (!block)
+     {
+       struct frame_info *selected_frame;
+       volatile struct gdb_exception except;
+ 
+       TRY_CATCH (except, RETURN_MASK_ALL)
+ 	{
+-	  selected_frame = get_selected_frame (_("No frame selected."));
+-	  block = get_frame_block (selected_frame, NULL);
++	  if (symbol && symbol_read_needs_frame(symbol)) {
++	    selected_frame = get_selected_frame (_("No frame selected."));
++	    block = get_frame_block (selected_frame, NULL);
++	  }
+ 	}
+       GDB_PY_HANDLE_EXCEPTION (except);
+     }
+ 
+-  TRY_CATCH (except, RETURN_MASK_ALL)
+-    {
+-      symbol = lookup_symbol (name, block, domain, &is_a_field_of_this);
+-    }
+-  GDB_PY_HANDLE_EXCEPTION (except);
+ 
+   ret_tuple = PyTuple_New (2);
+   if (!ret_tuple)
 @@ -564,6 +590,8 @@ to display demangled or mangled names.",
      "True if the symbol requires a frame for evaluation." },
    { "line", sympy_line, NULL,
