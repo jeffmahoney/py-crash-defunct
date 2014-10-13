@@ -1,0 +1,649 @@
+From: Jeff Mahoney <jeffm@suse.com>
+Subject: py-gdb: Add interface to access section information
+
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ gdb/Makefile.in              |    6 
+ gdb/python/py-objfile.c      |   34 +++
+ gdb/python/py-section.c      |  401 +++++++++++++++++++++++++++++++++++++++++++
+ gdb/python/py-symbol.c       |   44 +++-
+ gdb/python/python-internal.h |   10 +
+ gdb/python/python.c          |    1 
+ 6 files changed, 483 insertions(+), 13 deletions(-)
+
+--- a/gdb/Makefile.in	2014-09-18 09:26:02.989016114 -0400
++++ b/gdb/Makefile.in	2014-09-18 09:28:38.258689078 -0400
+@@ -369,6 +369,7 @@ SUBDIR_PYTHON_OBS = \
+ 	py-param.o \
+ 	py-prettyprint.o \
+ 	py-progspace.o \
++	py-section.o \
+ 	py-signalevent.o \
+ 	py-stopevent.o \
+ 	py-symbol.o \
+@@ -406,6 +407,7 @@ SUBDIR_PYTHON_SRCS = \
+ 	python/py-param.c \
+ 	python/py-prettyprint.c \
+ 	python/py-progspace.c \
++	python/py-section.c \
+ 	python/py-signalevent.c \
+ 	python/py-stopevent.c \
+ 	python/py-symbol.c \
+@@ -2519,6 +2521,10 @@ py-progspace.o: $(srcdir)/python/py-prog
+ 	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-progspace.c
+ 	$(POSTCOMPILE)
+ 
++py-section.o: $(srcdir)/python/py-section.c
++	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-section.c
++	$(POSTCOMPILE)
++
+ py-signalevent.o: $(srcdir)/python/py-signalevent.c
+ 	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-signalevent.c
+ 	$(POSTCOMPILE)
+--- a/gdb/python/py-objfile.c	2014-09-18 08:46:11.616403824 -0400
++++ b/gdb/python/py-objfile.c	2014-09-18 09:28:47.555572888 -0400
+@@ -23,7 +23,7 @@
+ #include "objfiles.h"
+ #include "language.h"
+ 
+-typedef struct
++typedef struct objfile_object
+ {
+   PyObject_HEAD
+ 
+@@ -42,9 +42,6 @@ typedef struct
+   PyObject *xmethods;
+ } objfile_object;
+ 
+-static PyTypeObject objfile_object_type
+-    CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("objfile_object");
+-
+ static const struct objfile_data *objfpy_objfile_data_key;
+ 
+ 
+@@ -328,6 +325,31 @@ objfile_to_objfile_object (struct objfil
+   return (PyObject *) object;
+ }
+ 
++static PyObject *
++objfpy_get_sections (PyObject *self, void *closure)
++{
++  objfile_object *obj = (objfile_object *) self;
++  PyObject *dict;
++  asection *section = obj->objfile->sections->the_bfd_section;
++
++  dict = PyDict_New();
++  if (!dict)
++    return NULL;
++
++  while (section) {
++    PyObject *sec = section_to_section_object(section, obj->objfile);
++    if (!sec) {
++      PyObject_Del(dict);
++      return NULL;
++    }
++
++    PyDict_SetItemString(dict, section->name, sec);
++    section = section->next;
++  }
++
++  return PyDictProxy_New(dict);
++}
++
+ int
+ gdbpy_initialize_objfile (void)
+ {
+@@ -364,10 +386,12 @@ static PyGetSetDef objfile_getset[] =
+     "Type printers.", NULL },
+   { "xmethods", objfpy_get_xmethods, NULL,
+     "Debug methods.", NULL },
++  { "sections", objfpy_get_sections, NULL,
++    "The sections that make up the objfile.", NULL },
+   { NULL }
+ };
+ 
+-static PyTypeObject objfile_object_type =
++PyTypeObject objfile_object_type =
+ {
+   PyVarObject_HEAD_INIT (NULL, 0)
+   "gdb.Objfile",		  /*tp_name*/
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/gdb/python/py-section.c	2014-09-18 09:26:04.034072553 -0400
+@@ -0,0 +1,401 @@
++/* Python interface to sections.
++
++   Copyright (C) 2008-2013 Free Software Foundation, Inc.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++#include "defs.h"
++#include "block.h"
++#include "exceptions.h"
++#include "frame.h"
++#include "symtab.h"
++#include "python-internal.h"
++#include "objfiles.h"
++
++typedef struct secpy_section_object {
++  PyObject_HEAD
++  asection *section;
++  struct objfile *objfile;
++  /* The GDB section structure this object is wrapping.  */
++  /* A section object is associated with an objfile, so keep track with
++     doubly-linked list, rooted in the objfile.  This lets us
++     invalidate the underlying section when the objfile is
++     deleted.  */
++  struct secpy_section_object *prev;
++  struct secpy_section_object *next;
++} section_object;
++
++/* Require a valid section.  All access to section_object->section should be
++   gated by this call.  */
++#define SYMPY_REQUIRE_VALID(section_obj, section)		\
++  do {							\
++    section = section_object_to_section (section_obj);	\
++    if (section == NULL)					\
++      {							\
++	PyErr_SetString (PyExc_RuntimeError,		\
++			 _("Section is invalid."));	\
++	return NULL;					\
++      }							\
++  } while (0)
++
++static const struct objfile_data *secpy_objfile_data_key;
++
++static PyObject *
++secpy_str (PyObject *self)
++{
++  PyObject *result;
++  asection *section = NULL;
++
++  SYMPY_REQUIRE_VALID (self, section);
++
++  result = PyString_FromString (section->name);
++
++  return result;
++}
++
++static PyObject *
++secpy_get_flags (PyObject *self, void *closure)
++{
++  asection *section = NULL;
++
++  SYMPY_REQUIRE_VALID (self, section);
++
++  return PyInt_FromLong (section->flags);
++}
++
++static PyObject *
++secpy_get_objfile (PyObject *self, void *closure)
++{
++  section_object *obj = (section_object *)self;
++
++  if (! PyObject_TypeCheck (self, &section_object_type))
++    return NULL;
++
++  return objfile_to_objfile_object (obj->objfile);
++}
++
++static PyObject *
++secpy_get_name (PyObject *self, void *closure)
++{
++  asection *section = NULL;
++
++  SYMPY_REQUIRE_VALID (self, section);
++
++  return PyString_FromString (section->name);
++}
++
++static PyObject *
++secpy_get_id (PyObject *self, void *closure)
++{
++  asection *section = NULL;
++
++  SYMPY_REQUIRE_VALID (self, section);
++
++  return PyInt_FromLong (section->id);
++}
++
++#define secpy_return_string(self, val)		\
++({						\
++  asection *section = NULL;			\
++  SYMPY_REQUIRE_VALID (self, section);		\
++  PyString_FromString (val);		\
++})
++
++#define secpy_return_longlong(self, val)	\
++({						\
++  asection *section = NULL;			\
++  SYMPY_REQUIRE_VALID (self, section);		\
++  PyLong_FromUnsignedLongLong (val);	\
++})
++
++static PyObject *
++secpy_get_vma (PyObject *self, void *closure)
++{
++  return secpy_return_longlong(self, section->vma);
++}
++
++static PyObject *
++secpy_get_lma (PyObject *self, void *closure)
++{
++  return secpy_return_longlong(self, section->lma);
++}
++
++static PyObject *
++secpy_get_size (PyObject *self, void *closure)
++{
++  return secpy_return_longlong(self, section->size);
++}
++
++static PyObject *
++secpy_get_rawsize (PyObject *self, void *closure)
++{
++  return secpy_return_longlong(self, section->rawsize);
++}
++
++static PyObject *
++secpy_get_compressed_size (PyObject *self, void *closure)
++{
++  return secpy_return_longlong(self, section->compressed_size);
++}
++
++static PyObject *
++secpy_get_print_name (PyObject *self, void *closure)
++{
++  return secpy_str (self);
++}
++
++static PyObject *
++secpy_is_compressed (PyObject *self, void *closure)
++{
++  asection *section = NULL;
++
++  SYMPY_REQUIRE_VALID (self, section);
++
++  return PyBool_FromLong (section->compress_status == 1);
++}
++
++/* Given a section, and a section_object that has previously been
++   allocated and initialized, populate the section_object with the
++   asection data.  Also, register the section_object life-cycle
++   with the life-cycle of the object file associated with this
++   section, if needed.  */
++static void
++set_section (section_object *obj, asection *section, struct objfile *objfile)
++{
++  obj->section = section;
++  obj->prev = NULL;
++  obj->objfile = objfile;
++  obj->next = objfile_data (obj->objfile, secpy_objfile_data_key);
++
++  if (obj->next)
++    obj->next->prev = obj;
++
++  set_objfile_data (obj->objfile, secpy_objfile_data_key, obj);
++}
++
++/* Create a new section object (gdb.Section) that encapsulates the struct
++   section object from GDB.  */
++PyObject *
++section_to_section_object (asection *section, struct objfile *objfile)
++{
++  section_object *sec_obj;
++
++  sec_obj = PyObject_New (section_object, &section_object_type);
++  if (sec_obj) {
++    set_section (sec_obj, section, objfile);
++  }
++
++  return (PyObject *) sec_obj;
++}
++
++/* Return the section that is wrapped by this section object.  */
++asection *
++section_object_to_section (PyObject *obj)
++{
++  if (! PyObject_TypeCheck (obj, &section_object_type))
++    return NULL;
++  return ((section_object *) obj)->section;
++}
++
++static void
++secpy_dealloc (PyObject *obj)
++{
++  section_object *section_obj = (section_object *) obj;
++
++  if (section_obj->prev)
++    section_obj->prev->next = section_obj->next;
++  else if (section_obj->objfile)
++    {
++      set_objfile_data (section_obj->objfile,
++			secpy_objfile_data_key, section_obj->next);
++    }
++  if (section_obj->next)
++    section_obj->next->prev = section_obj->prev;
++  section_obj->section = NULL;
++}
++
++static PyObject *
++secpy_is_valid (PyObject *self, PyObject *args)
++{
++  asection *section = NULL;
++
++  section = section_object_to_section (self);
++  if (section == NULL)
++    Py_RETURN_FALSE;
++
++  Py_RETURN_TRUE;
++}
++
++/* This function is called when an objfile is about to be freed.
++   Invalidate the section as further actions on the section would result
++   in bad data.  All access to obj->section should be gated by
++   SYMPY_REQUIRE_VALID which will raise an exception on invalid
++   sections.  */
++static void
++del_objfile_sections (struct objfile *objfile, void *datum)
++{
++  section_object *obj = datum;
++  while (obj)
++    {
++      section_object *next = obj->next;
++
++      obj->section = NULL;
++      obj->next = NULL;
++      obj->prev = NULL;
++
++      obj = next;
++    }
++}
++
++int
++gdbpy_initialize_sections (void)
++{
++  if (PyType_Ready (&section_object_type) < 0)
++    return -1;
++
++  /* Register an objfile "free" callback so we can properly
++     invalidate section when an object file that is about to be
++     deleted.  */
++  secpy_objfile_data_key
++    = register_objfile_data_with_cleanup (NULL, del_objfile_sections);
++
++  if (PyModule_AddIntConstant (gdb_module, "SEC_NO_FLAGS", SEC_NO_FLAGS) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_ALLOC", SEC_ALLOC) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LOAD", SEC_LOAD) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_RELOC", SEC_RELOC) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_READONLY", SEC_READONLY) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_CODE", SEC_CODE) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_DATA", SEC_DATA) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_ROM", SEC_ROM) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_CONSTRUCTOR",
++				  SEC_CONSTRUCTOR) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_HAS_CONTENTS",
++				  SEC_HAS_CONTENTS) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_NEVER_LOAD",
++				  SEC_NEVER_LOAD) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_THREAD_LOCAL",
++				  SEC_THREAD_LOCAL) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_HAS_GOT_REF",
++				  SEC_HAS_GOT_REF) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_IS_COMMON",
++				  SEC_IS_COMMON) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_DEBUGGING",
++				  SEC_DEBUGGING) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_IN_MEMORY",
++				  SEC_IN_MEMORY) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_EXCLUDE", SEC_EXCLUDE) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_SORT_ENTRIES",
++				  SEC_SORT_ENTRIES) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINK_ONCE",
++				  SEC_LINK_ONCE) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINK_DUPLICATES",
++				  SEC_LINK_DUPLICATES) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINK_DUPLICATES_DISCARD",
++				  SEC_LINK_DUPLICATES_DISCARD) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINK_DUPLICATES_ONE_ONLY",
++				  SEC_LINK_DUPLICATES_ONE_ONLY) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINK_DUPLICATES_SAME_SIZE",
++				  SEC_LINK_DUPLICATES_SAME_SIZE) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_LINKER_CREATED",
++				  SEC_LINKER_CREATED) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_KEEP", SEC_KEEP) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_SMALL_DATA",
++				  SEC_SMALL_DATA) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_MERGE", SEC_MERGE) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_STRNGS", SEC_STRINGS) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_GROUP", SEC_GROUP) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_COFF_SHARED_LIBRARY",
++				  SEC_COFF_SHARED_LIBRARY) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_ELF_REVERSE_COPY",
++				  SEC_ELF_REVERSE_COPY) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_COFF_SHARED",
++				  SEC_COFF_SHARED) < 0
++      || PyModule_AddIntConstant (gdb_module, "SEC_COFF_NOREAD",
++				  SEC_COFF_NOREAD) < 0)
++    return -1;
++
++  return gdb_pymodule_addobject (gdb_module, "Section",
++				 (PyObject *) &section_object_type);
++}
++
++
++
++static PyGetSetDef section_object_getset[] = {
++  { "flags", secpy_get_flags, NULL,
++    "Flags of the section.", NULL },
++  { "objfile", secpy_get_objfile, NULL,
++    "Object file in which the section appears.", NULL },
++  { "name", secpy_get_name, NULL,
++    "Name of the section, as it appears in the source code.", NULL },
++  { "size", secpy_get_size, NULL, "Size of the section.", NULL },
++  { "compressed_size", secpy_get_compressed_size, NULL,
++    "Compressed size of the section.", NULL },
++  { "rawsize", secpy_get_rawsize, NULL,
++    "Size of the section on disk.", NULL },
++  { "id", secpy_get_id, NULL,
++    "Sequence number of the section.", NULL },
++  { "print_name", secpy_get_print_name, NULL,
++    "Name of the section in a form suitable for output.\n\
++This is either name or linkage_name, depending on whether the user asked GDB\n\
++to display demangled or mangled names.", NULL },
++  { "vma", secpy_get_vma, NULL,
++    "Virtual memory address of the section at runtime." },
++  { "lma", secpy_get_lma, NULL,
++    "Load memory address of the section." },
++  { "is_compressed", secpy_is_compressed, NULL,
++    "True if the section is compressed." },
++  { NULL }  /* Sentinel */
++};
++
++static PyMethodDef section_object_methods[] = {
++  { "is_valid", secpy_is_valid, METH_NOARGS,
++    "is_valid () -> Boolean.\n\
++Return true if this section is valid, false if not." },
++  {NULL}  /* Sentinel */
++};
++
++PyTypeObject section_object_type = {
++  PyVarObject_HEAD_INIT (NULL, 0)
++  "gdb.Section",		  /*tp_name*/
++  sizeof (section_object),	  /*tp_basicsize*/
++  0,				  /*tp_itemsize*/
++  secpy_dealloc,		  /*tp_dealloc*/
++  0,				  /*tp_print*/
++  0,				  /*tp_getattr*/
++  0,				  /*tp_setattr*/
++  0,				  /*tp_compare*/
++  0,				  /*tp_repr*/
++  0,				  /*tp_as_number*/
++  0,				  /*tp_as_sequence*/
++  0,				  /*tp_as_mapping*/
++  0,				  /*tp_hash */
++  0,				  /*tp_call*/
++  secpy_str,			  /*tp_str*/
++  0,				  /*tp_getattro*/
++  0,				  /*tp_setattro*/
++  0,				  /*tp_as_buffer*/
++  Py_TPFLAGS_DEFAULT,		  /*tp_flags*/
++  "GDB section object",		  /*tp_doc */
++  0,				  /*tp_traverse */
++  0,				  /*tp_clear */
++  0,				  /*tp_richcompare */
++  0,				  /*tp_weaklistoffset */
++  0,				  /*tp_iter */
++  0,				  /*tp_iternext */
++  section_object_methods,	  /*tp_methods */
++  0,				  /*tp_members */
++  section_object_getset		  /*tp_getset */
++};
+--- a/gdb/python/py-symbol.c	2014-09-18 08:46:11.616403824 -0400
++++ b/gdb/python/py-symbol.c	2014-09-18 09:26:04.036072653 -0400
+@@ -234,6 +234,28 @@ sympy_is_valid (PyObject *self, PyObject
+   Py_RETURN_TRUE;
+ }
+ 
++static PyObject *
++sympy_section (PyObject *self, void *closure)
++{
++  struct symbol *symbol = NULL;
++  PyObject *section_obj;
++  struct obj_section *section;
++
++  SYMPY_REQUIRE_VALID (self, symbol);
++
++  section = SYMBOL_OBJ_SECTION(SYMBOL_OBJFILE(symbol), symbol);
++
++  if (section) {
++    section_obj = section_to_section_object(section->the_bfd_section,
++                                            SYMBOL_OBJFILE(symbol));
++    if (section_obj)
++      return section_obj;
++  }
++
++  Py_INCREF (Py_None);
++  return Py_None;
++}
++
+ /* Implementation of gdb.Symbol.value (self[, frame]) -> gdb.Value.  Returns
+    the value of the symbol, or an error in various circumstances.  */
+ 
+@@ -369,24 +391,28 @@ gdbpy_lookup_symbol (PyObject *self, PyO
+ 
+   if (block_obj)
+     block = block_object_to_block (block_obj);
+-  else
++
++  TRY_CATCH (except, RETURN_MASK_ALL)
++    {
++      symbol = lookup_symbol (name, block, domain, &is_a_field_of_this);
++    }
++  GDB_PY_HANDLE_EXCEPTION (except);
++
++  if (!block)
+     {
+       struct frame_info *selected_frame;
+       volatile struct gdb_exception except;
+ 
+       TRY_CATCH (except, RETURN_MASK_ALL)
+ 	{
+-	  selected_frame = get_selected_frame (_("No frame selected."));
+-	  block = get_frame_block (selected_frame, NULL);
++	  if (symbol && symbol_read_needs_frame(symbol)) {
++	    selected_frame = get_selected_frame (_("No frame selected."));
++	    block = get_frame_block (selected_frame, NULL);
++	  }
+ 	}
+       GDB_PY_HANDLE_EXCEPTION (except);
+     }
+ 
+-  TRY_CATCH (except, RETURN_MASK_ALL)
+-    {
+-      symbol = lookup_symbol (name, block, domain, &is_a_field_of_this);
+-    }
+-  GDB_PY_HANDLE_EXCEPTION (except);
+ 
+   ret_tuple = PyTuple_New (2);
+   if (!ret_tuple)
+@@ -564,6 +590,8 @@ to display demangled or mangled names.",
+     "True if the symbol requires a frame for evaluation." },
+   { "line", sympy_line, NULL,
+     "The source line number at which the symbol was defined." },
++  { "section", sympy_section, NULL,
++    "Section of executable where symbol resides." },
+   { NULL }  /* Sentinel */
+ };
+ 
+--- a/gdb/python/python-internal.h	2014-09-18 09:26:02.989016114 -0400
++++ b/gdb/python/python-internal.h	2014-09-18 09:28:38.258689078 -0400
+@@ -146,6 +146,8 @@ typedef int Py_ssize_t;
+ #define PyEval_ReleaseLock()
+ #endif
+ 
++#define gdb_py_long_from_pointer PyLong_FromLong
++
+ /* Python supplies HAVE_LONG_LONG and some `long long' support when it
+    is available.  These defines let us handle the differences more
+    cleanly.  */
+@@ -242,6 +244,10 @@ extern PyTypeObject block_object_type
+     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF("block_object");
+ extern PyTypeObject symbol_object_type
+     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("symbol_object");
++extern PyTypeObject section_object_type;
++     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("section_object");
++extern PyTypeObject objfile_object_type;
++     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("objfile_object");
+ extern PyTypeObject event_object_type
+     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("event_object");
+ extern PyTypeObject stop_event_object_type
+@@ -376,6 +382,7 @@ char *gdbpy_parse_command_name (const ch
+ 				struct cmd_list_element ***base_list,
+ 				struct cmd_list_element **start_list);
+ 
++PyObject *section_to_section_object (asection *sym, struct objfile *objf);
+ PyObject *symtab_and_line_to_sal_object (struct symtab_and_line sal);
+ PyObject *symtab_to_symtab_object (struct symtab *symtab);
+ PyObject *symbol_to_symbol_object (struct symbol *sym);
+@@ -406,6 +413,7 @@ PyObject *find_inferior_object (int pid)
+ PyObject *inferior_to_inferior_object (struct inferior *inferior);
+ 
+ const struct block *block_object_to_block (PyObject *obj);
++asection *section_object_to_section (PyObject *obj);
+ struct symbol *symbol_object_to_symbol (PyObject *obj);
+ struct value *value_object_to_value (PyObject *self);
+ struct value *convert_value_from_python (PyObject *obj);
+@@ -428,6 +436,8 @@ int gdbpy_initialize_commands (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_symbols (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
++int gdbpy_initialize_sections (void)
++  CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_symtabs (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_blocks (void)
+--- a/gdb/python/python.c	2014-09-18 09:26:02.989016114 -0400
++++ b/gdb/python/python.c	2014-09-18 09:28:38.258689078 -0400
+@@ -1787,6 +1787,7 @@ message == an error message without a st
+       || gdbpy_initialize_commands () < 0
+       || gdbpy_initialize_symbols () < 0
+       || gdbpy_initialize_symtabs () < 0
++      || gdbpy_initialize_sections () < 0
+       || gdbpy_initialize_blocks () < 0
+       || gdbpy_initialize_functions () < 0
+       || gdbpy_initialize_parameters () < 0
+

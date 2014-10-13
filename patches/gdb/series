@@ -1,0 +1,3 @@
+gdb-7.8-py-gdb-allow-lookup_symbol-to-return-static-symbols
+gdb-7.8-py-gdb-add-interface-to-access-section-information
+gdb-7.8-py-gdb-add-interface-to-access-minimal_symbols

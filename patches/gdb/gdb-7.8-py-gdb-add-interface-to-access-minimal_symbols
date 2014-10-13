@@ -1,0 +1,441 @@
+From: Jeff Mahoney <jeffm@suse.com>
+Subject: py-gdb: Add interface to access minimal_symbols
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ gdb/Makefile.in              |    6 
+ gdb/python/py-minsymbol.c    |  347 +++++++++++++++++++++++++++++++++++++++++++
+ gdb/python/python-internal.h |    6 
+ gdb/python/python.c          |    5 
+ 4 files changed, 364 insertions(+)
+
+--- a/gdb/Makefile.in	2014-09-18 09:27:53.861671497 -0400
++++ b/gdb/Makefile.in	2014-09-18 09:28:11.039447634 -0400
+@@ -364,6 +364,7 @@ SUBDIR_PYTHON_OBS = \
+ 	py-infthread.o \
+ 	py-lazy-string.o \
+ 	py-linetable.o \
++	py-minsymbol.o \
+ 	py-newobjfileevent.o \
+ 	py-objfile.o \
+ 	py-param.o \
+@@ -402,6 +403,7 @@ SUBDIR_PYTHON_SRCS = \
+ 	python/py-infthread.c \
+ 	python/py-lazy-string.c \
+ 	python/py-linetable.c \
++	python/py-minsymbol.c \
+ 	python/py-newobjfileevent.c \
+ 	python/py-objfile.c \
+ 	python/py-param.c \
+@@ -2501,6 +2503,10 @@ py-linetable.o: $(srcdir)/python/py-line
+ 	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-linetable.c
+ 	$(POSTCOMPILE)
+ 
++py-minsymbol.o: $(srcdir)/python/py-minsymbol.c
++	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-minsymbol.c
++	$(POSTCOMPILE)
++
+ py-newobjfileevent.o: $(srcdir)/python/py-newobjfileevent.c
+ 	$(COMPILE) $(PYTHON_CFLAGS) $(srcdir)/python/py-newobjfileevent.c
+ 	$(POSTCOMPILE)
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/gdb/python/py-minsymbol.c	2014-09-18 09:28:11.040447588 -0400
+@@ -0,0 +1,347 @@
++/* Python interface to minsymbols.
++
++   Copyright (C) 2008-2013 Free Software Foundation, Inc.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++#include "defs.h"
++#include "block.h"
++#include "exceptions.h"
++#include "frame.h"
++#include "symtab.h"
++#include "python-internal.h"
++#include "objfiles.h"
++#include "value.h"
++
++typedef struct msympy_symbol_object {
++  PyObject_HEAD
++  /* The GDB minimal_symbol structure this object is wrapping.  */
++  struct minimal_symbol *minsym;
++
++  struct type *type;
++  /* A symbol object is associated with an objfile, so keep track with
++     doubly-linked list, rooted in the objfile.  This lets us
++     invalidate the underlying struct minimal_symbol when the objfile is
++     deleted.  */
++  struct msympy_symbol_object *prev;
++  struct msympy_symbol_object *next;
++} minsym_object;
++
++PyObject *minsym_to_minsym_object (struct minimal_symbol *minsym);
++struct minimal_symbol *minsym_object_to_minsym (PyObject *obj);
++/* Require a valid symbol.  All access to minsym_object->symbol should be
++   gated by this call.  */
++#define MSYMPY_REQUIRE_VALID(minsym_obj, minsym)	\
++  do {							\
++    minsym = minsym_object_to_minsym (minsym_obj);	\
++    if (minsym == NULL)				\
++      {							\
++	PyErr_SetString (PyExc_RuntimeError,		\
++			 _("MiniSymbol is invalid."));	\
++	return NULL;					\
++      }							\
++  } while (0)
++
++static PyObject *
++msympy_str (PyObject *self)
++{
++  PyObject *result;
++  struct minimal_symbol *minsym = NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++
++  result = PyString_FromString (MSYMBOL_PRINT_NAME (minsym));
++
++  return result;
++}
++
++static PyObject *
++msympy_get_name (PyObject *self, void *closure)
++{
++  struct minimal_symbol *minsym = NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++
++  return PyString_FromString (MSYMBOL_NATURAL_NAME (minsym));
++}
++
++static PyObject *
++msympy_get_file_name (PyObject *self, void *closure)
++{
++  struct minimal_symbol *minsym = NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++
++  return PyString_FromString (minsym->filename);
++}
++
++static PyObject *
++msympy_get_linkage_name (PyObject *self, void *closure)
++{
++  struct minimal_symbol *minsym = NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++
++  return PyString_FromString (MSYMBOL_LINKAGE_NAME (minsym));
++}
++
++static PyObject *
++msympy_get_print_name (PyObject *self, void *closure)
++{
++  struct minimal_symbol *minsym = NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++
++  return msympy_str (self);
++}
++
++static PyObject *
++msympy_is_valid (PyObject *self, PyObject *args)
++{
++  struct minimal_symbol *minsym = NULL;
++
++  minsym = minsym_object_to_minsym (self);
++  if (minsym == NULL)
++    Py_RETURN_FALSE;
++
++  Py_RETURN_TRUE;
++}
++
++/* Implementation of gdb.MiniSymbol.value (self) -> gdb.Value.  Returns
++   the value of the symbol, or an error in various circumstances.  */
++
++static PyObject *
++msympy_value (PyObject *self, PyObject *args)
++{
++  minsym_object *minsym_obj = (minsym_object *)self;
++  struct minimal_symbol *minsym = NULL;
++  struct value *value = NULL;
++  volatile struct gdb_exception except;
++
++  if (!PyArg_ParseTuple (args, ""))
++    return NULL;
++
++  MSYMPY_REQUIRE_VALID (self, minsym);
++  TRY_CATCH (except, RETURN_MASK_ALL)
++    {
++      value = value_from_ulongest(minsym_obj->type,
++				  MSYMBOL_VALUE_RAW_ADDRESS(minsym));
++      if (value)
++	set_value_address(value, MSYMBOL_VALUE_RAW_ADDRESS(minsym));
++    }
++  GDB_PY_HANDLE_EXCEPTION (except);
++
++  return value_to_value_object (value);
++}
++
++/* Given a symbol, and a minsym_object that has previously been
++   allocated and initialized, populate the minsym_object with the
++   struct minimal_symbol data.  Also, register the minsym_object life-cycle
++   with the life-cycle of the object file associated with this
++   symbol, if needed.  */
++static void
++set_symbol (minsym_object *obj, struct minimal_symbol *minsym)
++{
++  obj->minsym = minsym;
++  switch (minsym->type) {
++  case mst_text:
++  case mst_solib_trampoline:
++  case mst_file_text:
++  case mst_text_gnu_ifunc:
++  case mst_slot_got_plt:
++    obj->type = builtin_type(python_gdbarch)->builtin_func_ptr;
++    break;
++
++  case mst_data:
++  case mst_abs:
++  case mst_file_data:
++  case mst_file_bss:
++    obj->type = builtin_type(python_gdbarch)->builtin_data_ptr;
++    break;
++
++  case mst_unknown:
++  default:
++    obj->type = builtin_type(python_gdbarch)->builtin_void;
++    break;
++  }
++
++  obj->prev = NULL;
++  obj->next = NULL;
++}
++
++/* Create a new symbol object (gdb.MiniSymbol) that encapsulates the struct
++   symbol object from GDB.  */
++PyObject *
++minsym_to_minsym_object (struct minimal_symbol *minsym)
++{
++  minsym_object *msym_obj;
++
++  msym_obj = PyObject_New (minsym_object, &minsym_object_type);
++  if (msym_obj)
++    set_symbol (msym_obj, minsym);
++
++  return (PyObject *) msym_obj;
++}
++
++/* Return the symbol that is wrapped by this symbol object.  */
++struct minimal_symbol *
++minsym_object_to_minsym (PyObject *obj)
++{
++  if (! PyObject_TypeCheck (obj, &minsym_object_type))
++    return NULL;
++  return ((minsym_object *) obj)->minsym;
++}
++
++static void
++msympy_dealloc (PyObject *obj)
++{
++  minsym_object *msym_obj = (minsym_object *) obj;
++
++  if (msym_obj->prev)
++    msym_obj->prev->next = msym_obj->next;
++  if (msym_obj->next)
++    msym_obj->next->prev = msym_obj->prev;
++  msym_obj->minsym = NULL;
++}
++
++/* Implementation of
++   gdb.lookup_minimal_symbol (name) -> symbol or None.  */
++
++PyObject *
++gdbpy_lookup_minimal_symbol (PyObject *self, PyObject *args, PyObject *kw)
++{
++  int domain = VAR_DOMAIN;
++  const char *name;
++  static char *keywords[] = { "name", NULL };
++  struct bound_minimal_symbol bound_minsym;
++  struct minimal_symbol *minsym = NULL;
++  PyObject *msym_obj;
++  volatile struct gdb_exception except;
++
++  if (!PyArg_ParseTupleAndKeywords (args, kw, "s|", keywords, &name))
++    return NULL;
++
++  TRY_CATCH (except, RETURN_MASK_ALL)
++    {
++      bound_minsym = lookup_minimal_symbol (name, NULL, NULL);
++    }
++  GDB_PY_HANDLE_EXCEPTION (except);
++
++  if (minsym)
++    {
++      msym_obj = minsym_to_minsym_object (bound_minsym.minsym);
++      if (!msym_obj)
++	return NULL;
++    }
++  else
++    {
++      msym_obj = Py_None;
++      Py_INCREF (Py_None);
++    }
++
++  return msym_obj;
++}
++
++int
++gdbpy_initialize_minsymbols (void)
++{
++  if (PyType_Ready (&minsym_object_type) < 0)
++    return -1;
++
++  if (PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_UNKNOWN",
++			       mst_unknown) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_TEXT", mst_text) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_TEXT_GNU_IFUNC",
++			      mst_text_gnu_ifunc) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_SLOT_GOT_PLT",
++			      mst_slot_got_plt) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_DATA", mst_data) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_BSS", mst_bss) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_ABS", mst_abs) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_SOLIB_TRAMPOLINE",
++			      mst_solib_trampoline) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_FILE_TEXT",
++			      mst_file_text) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_FILE_DATA",
++			      mst_file_data) < 0
++  || PyModule_AddIntConstant (gdb_module, "MINSYMBOL_TYPE_FILE_BSS",
++			      mst_file_bss) < 0)
++    return -1;
++
++  return gdb_pymodule_addobject (gdb_module, "MiniSymbol",
++				 (PyObject *) &minsym_object_type);
++}
++
++
++
++static PyGetSetDef minsym_object_getset[] = {
++  { "name", msympy_get_name, NULL,
++    "Name of the symbol, as it appears in the source code.", NULL },
++  { "linkage_name", msympy_get_linkage_name, NULL,
++    "Name of the symbol, as used by the linker (i.e., may be mangled).",
++    NULL },
++  { "filename", msympy_get_file_name, NULL,
++    "Name of source file the symbol is in. Only applies for mst_file_*.",
++    NULL },
++  { "print_name", msympy_get_print_name, NULL,
++    "Name of the symbol in a form suitable for output.\n\
++This is either name or linkage_name, depending on whether the user asked GDB\n\
++to display demangled or mangled names.", NULL },
++  { NULL }  /* Sentinel */
++};
++
++static PyMethodDef minsym_object_methods[] = {
++  { "is_valid", msympy_is_valid, METH_NOARGS,
++    "is_valid () -> Boolean.\n\
++Return true if this symbol is valid, false if not." },
++  { "value", msympy_value, METH_VARARGS,
++    "value ([frame]) -> gdb.Value\n\
++Return the value of the symbol." },
++  {NULL}  /* Sentinel */
++};
++
++PyTypeObject minsym_object_type = {
++  PyVarObject_HEAD_INIT (NULL, 0)
++  "gdb.MiniSymbol",			  /*tp_name*/
++  sizeof (minsym_object),	  /*tp_basicsize*/
++  0,				  /*tp_itemsize*/
++  msympy_dealloc,		  /*tp_dealloc*/
++  0,				  /*tp_print*/
++  0,				  /*tp_getattr*/
++  0,				  /*tp_setattr*/
++  0,				  /*tp_compare*/
++  0,				  /*tp_repr*/
++  0,				  /*tp_as_number*/
++  0,				  /*tp_as_sequence*/
++  0,				  /*tp_as_mapping*/
++  0,				  /*tp_hash */
++  0,				  /*tp_call*/
++  msympy_str,			  /*tp_str*/
++  0,				  /*tp_getattro*/
++  0,				  /*tp_setattro*/
++  0,				  /*tp_as_buffer*/
++  Py_TPFLAGS_DEFAULT,		  /*tp_flags*/
++  "GDB minimal symbol object",	  /*tp_doc */
++  0,				  /*tp_traverse */
++  0,				  /*tp_clear */
++  0,				  /*tp_richcompare */
++  0,				  /*tp_weaklistoffset */
++  0,				  /*tp_iter */
++  0,				  /*tp_iternext */
++  minsym_object_methods,	  /*tp_methods */
++  0,				  /*tp_members */
++  minsym_object_getset		  /*tp_getset */
++};
+--- a/gdb/python/python-internal.h	2014-09-18 09:26:04.036072653 -0400
++++ b/gdb/python/python-internal.h	2014-09-18 09:28:11.041447541 -0400
+@@ -244,6 +244,8 @@ extern PyTypeObject block_object_type
+     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF("block_object");
+ extern PyTypeObject symbol_object_type
+     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("symbol_object");
++extern PyTypeObject minsym_object_type;
++     CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("minsym_object");
+ extern PyTypeObject section_object_type;
+      CPYCHECKER_TYPE_OBJECT_FOR_TYPEDEF ("section_object");
+ extern PyTypeObject objfile_object_type;
+@@ -364,6 +366,8 @@ PyObject *gdbpy_frame_stop_reason_string
+ PyObject *gdbpy_lookup_symbol (PyObject *self, PyObject *args, PyObject *kw);
+ PyObject *gdbpy_lookup_global_symbol (PyObject *self, PyObject *args,
+ 				      PyObject *kw);
++PyObject *gdbpy_lookup_minimal_symbol (PyObject *self, PyObject *args,
++				       PyObject *kw);
+ PyObject *gdbpy_newest_frame (PyObject *self, PyObject *args);
+ PyObject *gdbpy_selected_frame (PyObject *self, PyObject *args);
+ PyObject *gdbpy_block_for_pc (PyObject *self, PyObject *args);
+@@ -438,6 +442,8 @@ int gdbpy_initialize_symbols (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_sections (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
++int gdbpy_initialize_minsymbols (void)
++  CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_symtabs (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_blocks (void)
+--- a/gdb/python/python.c	2014-09-18 09:27:53.864671568 -0400
++++ b/gdb/python/python.c	2014-09-18 09:28:11.043447448 -0400
+@@ -1786,6 +1786,7 @@ message == an error message without a st
+       || gdbpy_initialize_frames () < 0
+       || gdbpy_initialize_commands () < 0
+       || gdbpy_initialize_symbols () < 0
++      || gdbpy_initialize_minsymbols () < 0
+       || gdbpy_initialize_symtabs () < 0
+       || gdbpy_initialize_sections () < 0
+       || gdbpy_initialize_blocks () < 0
+@@ -2008,6 +2009,10 @@ a boolean indicating if name is a field
+     METH_VARARGS | METH_KEYWORDS,
+     "lookup_global_symbol (name [, domain]) -> symbol\n\
+ Return the symbol corresponding to the given name (or None)." },
++{ "lookup_minimal_symbol", (PyCFunction) gdbpy_lookup_minimal_symbol,
++    METH_VARARGS | METH_KEYWORDS,
++    "lookup_minimal_symbol (name) -> minsym\n\
++Return the symbol corresponding to the given name (or None)." },
+   { "block_for_pc", gdbpy_block_for_pc, METH_VARARGS,
+     "Return the block containing the given pc value, or None." },
+   { "solib_name", gdbpy_solib_name, METH_VARARGS,
+
